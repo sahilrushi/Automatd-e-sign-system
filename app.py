@@ -8,7 +8,7 @@ from email.message import EmailMessage
 import smtplib
 from dotenv import load_dotenv
 
-# Load .env variables
+# Load environment variables from .env
 load_dotenv()
 
 app = Flask(__name__)
@@ -30,14 +30,15 @@ FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
 serializer = URLSafeSerializer(app.secret_key)
 
 
+# ---------------- EMAIL FUNCTION ----------------
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:5000")
 def send_sign_email(to_email, token):
-    # link = url_for('sign_document', token=token, _external=True)
-    link='https://www.google.com/webhp?hl=en&sa=X&ved=0ahUKEwjZvpPWhsGPAxXeyjgGHZGCHIgQPAgJ'
+    link = url_for('preview_document', token=token, _external=True)
     msg = EmailMessage()
-    msg['Subject'] = 'Please sign the document'
+    msg['Subject'] = 'Please review and sign the document'
     msg['From'] = FROM_EMAIL
     msg['To'] = to_email
-    msg.set_content(f'You were requested to sign a document. Click here to sign: {link}')
+    msg.set_content(f"You were requested to sign a document. Review it here: {link}")
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
         s.starttls()
@@ -45,6 +46,7 @@ def send_sign_email(to_email, token):
         s.send_message(msg)
 
 
+# ---------------- FILE UPLOAD ----------------
 @app.route('/', methods=['GET', 'POST'])
 def upload():
     if request.method == 'POST':
@@ -73,42 +75,62 @@ def upload():
             flash("No signer email found in document")
             return redirect(request.url)
 
-        candidate = emails[0]  # first email for demo
-        payload = {"path": save_path, "filename": filename, "email": candidate, "hash": file_hash}
+        candidate = emails[0]  # first email found
+        payload = {"filename": filename, "email": candidate, "hash": file_hash}
         token = serializer.dumps(payload)
 
-        # Send sign email
+        # link to preview page
+        preview_link = url_for('preview_document', token=token, _external=True)
+
+        # send email with preview link
         send_sign_email(candidate, token)
 
         flash(f"Email sent to {candidate}")
-        return render_template("upload.html", message=f"Email sent to {candidate}")
+        return redirect(preview_link)
 
     return render_template("upload.html")
 
 
-@app.route('/sign/<token>', methods=['GET', 'POST'])
+# ---------------- PREVIEW DOCUMENT ----------------
+@app.route('/preview/<token>')
+def preview_document(token):
+    try:
+        data = serializer.loads(token)
+    except Exception:
+        return "Invalid or expired link", 400
+
+    filename = data['filename']
+    file_url = url_for('uploaded_file', filename=filename, _external=True)
+
+    return render_template("preview.html", file_url=file_url, token=token, email=data['email'])
+
+
+# ---------------- SIGN DOCUMENT ----------------
+@app.route('/sign/<token>', methods=['POST'])
 def sign_document(token):
     try:
         data = serializer.loads(token)
     except Exception:
         return "Invalid or expired link", 400
 
-    filepath = data['path']
     filename = data['filename']
-    recipient = data['email']
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
 
-    if request.method == 'POST':
-        sig_image = os.path.join("static", "signature.png")
-        out_stream = overlay_signature_on_pdf(filepath, sig_image)
-        signed_name = f"signed_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
-        out_path = os.path.join(SIGNED_FOLDER, signed_name)
+    sig_image = os.path.join("static", "signature.png")
+    out_stream = overlay_signature_on_pdf(filepath, sig_image)
+    signed_name = f"signed_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
+    out_path = os.path.join(SIGNED_FOLDER, signed_name)
 
-        with open(out_path, "wb") as out_f:
-            out_f.write(out_stream.read())
+    with open(out_path, "wb") as out_f:
+        out_f.write(out_stream.read())
 
-        return send_file(out_path, as_attachment=True)
+    return send_file(out_path, as_attachment=True)
 
-    return render_template("sign_page.html", recipient=recipient, filename=filename, token=token)
+
+# ---------------- SERVE UPLOADED FILES ----------------
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_file(os.path.join(UPLOAD_FOLDER, filename))
 
 
 if __name__ == '__main__':
