@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Preview</title>
+</head>
+<body>
+    <h2>Document Preview for Signing</h2>
+
+    <!-- Embed PDF viewer -->
+    <iframe src="{{ file_url }}" width="100%" height="600px"></iframe>
+
+    <form method="post" action="{{ url_for('sign_document', token=token) }}">
+        <button type="submit">Sign this Document</button>
+    </form>
+</body>
+</html>
