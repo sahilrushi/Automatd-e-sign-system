@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><title>Preview and Place Signature</title></head>
+<body>
+  <h2>Preview Document: {{ filename }}</h2>
+  <iframe src="{{ file_url }}" width="100%" height="600px"></iframe>
+
+  <form method="post" action="{{ url_for('place_signature', token=token) }}">
+    <button type="submit">Place Signature (automatic)</button>
+  </form>
+</body>
+</html>
