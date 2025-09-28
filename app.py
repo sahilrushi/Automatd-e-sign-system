@@ -5,9 +5,9 @@ from flask import Flask, request, render_template, redirect, url_for, send_file,
 from itsdangerous import URLSafeSerializer
 from signer_utils import (
     extract_emails_and_sigboxes_from_pdf,
-    extract_emails_and_sigpos_from_docx,
     overlay_signature_on_pdf_at_candidates,
-    find_signature_candidates_by_ocr
+    find_signature_candidates_by_ocr,
+    convert_image_to_pdf
 )
 from email.message import EmailMessage
 import smtplib
@@ -54,6 +54,15 @@ def send_sign_email(to_email, token):
         s.send_message(msg)
 
 
+# Allowed upload extensions (images + pdf + docx)
+ALLOWED_EXT = {'.pdf', '.docx', '.doc', '.png', '.jpg', '.jpeg', '.tiff', '.bmp'}
+
+
+def allowed_filename(fname: str) -> bool:
+    _, ext = os.path.splitext(fname.lower())
+    return ext in ALLOWED_EXT
+
+
 # Upload route
 @app.route('/', methods=['GET', 'POST'])
 def upload():
@@ -65,8 +74,24 @@ def upload():
 
         # Sanitize filename
         filename = secure_filename(f.filename)
+        if not allowed_filename(filename):
+            flash("File type not supported. Upload PDF, DOCX or image (png/jpg/tiff).")
+            return redirect(request.url)
+
         save_path = os.path.join(UPLOAD_FOLDER, filename)
         f.save(save_path)
+
+        # If user uploaded an image (png/jpg/etc), convert to PDF and use that PDF for downstream
+        _, ext = os.path.splitext(filename.lower())
+        if ext in {'.png', '.jpg', '.jpeg', '.tiff', '.bmp'}:
+            try:
+                converted_pdf_path = convert_image_to_pdf(save_path)  # returns path to PDF in uploads/
+                # update filename and save_path to point to PDF version
+                filename = os.path.basename(converted_pdf_path)
+                save_path = converted_pdf_path
+            except Exception as e:
+                flash(f"Failed to convert image to PDF for OCR: {e}")
+                return redirect(request.url)
 
         # File hash
         with open(save_path, "rb") as fh:
@@ -74,10 +99,14 @@ def upload():
 
         # Extract emails (from doc content)
         emails, sig_boxes = ([], None)
-        if filename.lower().endswith('.pdf'):
-            emails, sig_boxes = extract_emails_and_sigboxes_from_pdf(save_path)
-        elif filename.lower().endswith(('.docx', '.doc')):
-            emails, sig_boxes = extract_emails_and_sigpos_from_docx(save_path)
+        try:
+            if filename.lower().endswith('.pdf'):
+                emails, sig_boxes = extract_emails_and_sigboxes_from_pdf(save_path)
+            elif filename.lower().endswith(('.docx', '.doc')):
+                emails, sig_boxes = extract_emails_and_sigpos_from_docx(save_path)
+        except Exception:
+            # proceed without email extraction if it fails
+            emails = []
 
         # Token payload
         payload = {"filename": filename, "hash": file_hash, "email": (emails[0] if emails else "")}
@@ -110,26 +139,39 @@ def place_signature(token):
     except Exception:
         return "Invalid link", 400
 
-    filename = data['filename']
-    pdf_path = os.path.join(UPLOAD_FOLDER, filename)
-    sig_image_path = os.path.join(STATIC_FOLDER, "signature.png")
+    filename = data.get('filename')
+    if not filename:
+        return "Filename missing in token", 400
 
+    pdf_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(pdf_path):
+        return "Uploaded PDF not found", 404
+
+    sig_image_path = os.path.join(STATIC_FOLDER, "signature.png")
     if not os.path.exists(sig_image_path):
         return "Signature image not found. Please upload one to /static/signature.png", 404
 
-    # Step 1: Find candidates by OCR
-    candidates = find_signature_candidates_by_ocr(pdf_path, dpi=200)
+    # Step 1: Find candidates by OCR (works for scanned PDFs and normal PDFs).
+    try:
+        candidates = find_signature_candidates_by_ocr(pdf_path, dpi=300, conf_threshold=30)
+    except Exception as e:
+        app.logger.exception("OCR candidate detection failed: %s", e)
+        candidates = []
 
     # Step 2: Fallback using heuristic if no OCR candidates
     if not candidates:
-        _, sig_boxes = extract_emails_and_sigboxes_from_pdf(pdf_path)
+        try:
+            _, sig_boxes = extract_emails_and_sigboxes_from_pdf(pdf_path)
+        except Exception:
+            sig_boxes = None
+
         if sig_boxes:
             candidates = []
             for s in sig_boxes:
                 candidates.append({
                     "page": s.get('page', 0),
                     "x": s.get('x0', 50),
-                    "y": s.get('y0', 50),
+                    "y": s.get('y0_top', 50),
                     "width": max(150, s.get('x1', 200) - s.get('x0', 50)),
                     "height": max(40, s.get('y1', 100) - s.get('y0', 50)),
                     "score": 0.4,
@@ -140,7 +182,11 @@ def place_signature(token):
         return "No suitable place for signature found", 400
 
     # Step 3: Overlay signature
-    out_stream = overlay_signature_on_pdf_at_candidates(pdf_path, sig_image_path, candidates, pick_first=True)
+    try:
+        out_stream = overlay_signature_on_pdf_at_candidates(pdf_path, sig_image_path, candidates, pick_first=True)
+    except Exception as e:
+        app.logger.exception("Failed during overlay: %s", e)
+        return f"Error stamping signature: {e}", 500
 
     # Step 4: Save signed file
     signed_name = f"signed_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{filename}"
